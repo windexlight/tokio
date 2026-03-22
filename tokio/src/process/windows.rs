@@ -14,6 +14,23 @@
 //! nonblocking fashion, but failing that it'll fire off a
 //! `RegisterWaitForSingleObject` and then wait on the other end of the oneshot
 //! from then on out.
+//!
+//! # Child stdio and overlapped handles
+//!
+//! Child stdio handles are read via `Blocking<ArcFile>` on a thread-pool
+//! thread. On Windows, `std::fs::File::read` aborts the process if the
+//! underlying handle was opened with `FILE_FLAG_OVERLAPPED` (see
+//! rust-lang/rust#81357). Handles of this kind can appear in the stdio chain
+//! when a child process inherits them from a parent — for example, when an SSH
+//! agent uses overlapped named pipes for IPC and those pipes
+//! end up inherited across `CreateProcess`.
+//!
+//! To handle this, `stdio()` detects overlapped handles via
+//! `NtQueryInformationFile` and wraps them in `OverlappedFile`, which performs
+//! I/O with `ReadFile`/`WriteFile` and an explicit `OVERLAPPED` structure.
+//! Seekable overlapped handles (`FILE_TYPE_DISK`) are rejected with an
+//! `Unsupported` error because position tracking is not implemented.
+//! Non-overlapped handles continue to use the original `std::fs::File` path.
 
 use crate::io::{blocking::Blocking, AsyncRead, AsyncWrite, ReadBuf};
 use crate::process::kill::Kill;
@@ -34,9 +51,9 @@ use std::task::{Context, Poll};
 
 use windows_sys::{
     Win32::Foundation::{
-        CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE,
-        STATUS_SUCCESS, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_IO_PENDING,
-        WAIT_FAILED,
+        CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, HANDLE,
+        INVALID_HANDLE_VALUE, STATUS_SUCCESS, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF,
+        ERROR_IO_PENDING, WAIT_FAILED,
     },
     Win32::Storage::FileSystem::{ReadFile, WriteFile, GetFileType, FILE_TYPE_DISK},
     Win32::System::Threading::{
@@ -99,11 +116,20 @@ fn is_seekable(handle: HANDLE) -> bool {
 /// itself) eliminates the ambiguity that made the stdlib's fallback
 /// `WaitForSingleObject`-on-file-handle approach unreliable.
 ///
-/// Note: `ReadFile`/`WriteFile` on overlapped handles do not advance an
-/// implicit file position — the `Offset`/`OffsetHigh` fields of the
-/// `OVERLAPPED` struct control position for seekable files. For named pipes
-/// (the primary use case here) position is irrelevant. If this type is ever
-/// extended to seekable overlapped files, position tracking will be needed.
+/// # Seekable overlapped handles
+///
+/// `ReadFile`/`WriteFile` on overlapped handles do not advance an implicit
+/// file position. For pipes and character devices (`FILE_TYPE_PIPE`,
+/// `FILE_TYPE_CHAR`) this is irrelevant because those handle types have no
+/// seek pointer and the kernel ignores the `Offset`/`OffsetHigh` fields of
+/// the `OVERLAPPED` struct.
+///
+/// For disk files (`FILE_TYPE_DISK`) opened with `FILE_FLAG_OVERLAPPED`,
+/// omitting position tracking would cause every read to return data from
+/// offset 0 and every write to overwrite from the beginning — silent data
+/// corruption with no error. [`stdio`] detects this combination and returns
+/// an `Unsupported` error rather than constructing an `OverlappedFile`, so
+/// this type is only ever instantiated for non-seekable handles.
 ///
 /// See: <https://github.com/rust-lang/rust/issues/81357>
 struct OverlappedFile {
@@ -178,7 +204,7 @@ impl io::Read for OverlappedFile {
                 return Ok(bytes_read as usize);
             }
 
-            match windows_sys::Win32::Foundation::GetLastError() {
+            match GetLastError() {
                 ERROR_IO_PENDING => {
                     // Wait for the overlapped operation to complete on our
                     // dedicated event object.
@@ -195,7 +221,7 @@ impl io::Read for OverlappedFile {
                         0,
                     );
                     if ok == 0 {
-                        match windows_sys::Win32::Foundation::GetLastError() {
+                        match GetLastError() {
                             ERROR_BROKEN_PIPE | ERROR_HANDLE_EOF => return Ok(0),
                             e => return Err(io::Error::from_raw_os_error(e as i32)),
                         }
@@ -229,7 +255,7 @@ impl io::Write for OverlappedFile {
                 return Ok(bytes_written as usize);
             }
 
-            match windows_sys::Win32::Foundation::GetLastError() {
+            match GetLastError() {
                 ERROR_IO_PENDING => {
                     let wait = WaitForSingleObject(self.event, INFINITE);
                     if wait == WAIT_FAILED {
@@ -243,7 +269,7 @@ impl io::Write for OverlappedFile {
                         0,
                     );
                     if ok == 0 {
-                        match windows_sys::Win32::Foundation::GetLastError() {
+                        match GetLastError() {
                             ERROR_BROKEN_PIPE | ERROR_HANDLE_EOF => return Ok(0),
                             e => return Err(io::Error::from_raw_os_error(e as i32)),
                         }
