@@ -63,15 +63,17 @@ use windows_sys::{
 unsafe fn is_overlapped_handle(handle: HANDLE) -> bool {
     // NtQueryInformationFile requires an IO_STATUS_BLOCK as an out-parameter.
     // We only care about the return value of the syscall, not the status block.
-    let mut io_status = std::mem::zeroed();
+    let mut io_status = unsafe { std::mem::zeroed() };
     let mut mode: u32 = 0;
-    let status = NtQueryInformationFile(
-        handle,
-        &mut io_status,
-        &mut mode as *mut u32 as *mut std::ffi::c_void,
-        std::mem::size_of::<u32>() as u32,
-        FileModeInformation,
-    );
+    let status = unsafe {
+        NtQueryInformationFile(
+            handle,
+            &mut io_status,
+            &mut mode as *mut u32 as *mut std::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+            FileModeInformation,
+        )
+    };
     if status != STATUS_SUCCESS {
         // Conservatively treat unknown handles as overlapped so we never call
         // std::fs::File::read on one.
@@ -126,7 +128,7 @@ impl OverlappedFile {
         // bManualReset = 1          → manual-reset; we reset it ourselves
         // bInitialState = 0         → initially unsignaled
         // lpName = null             → unnamed
-        let event = CreateEventW(null_mut(), 1, 0, null_mut());
+        let event = unsafe { CreateEventW(null_mut(), 1, 0, null_mut()) };
         if event.is_null() || event == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
         }
