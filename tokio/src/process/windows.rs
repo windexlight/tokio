@@ -38,7 +38,7 @@ use windows_sys::{
         STATUS_SUCCESS, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_IO_PENDING,
         WAIT_FAILED,
     },
-    Win32::Storage::FileSystem::{ReadFile, WriteFile},
+    Win32::Storage::FileSystem::{ReadFile, WriteFile, GetFileType, FILE_TYPE_DISK},
     Win32::System::Threading::{
         CreateEventW, GetCurrentProcess, RegisterWaitForSingleObject, UnregisterWaitEx,
         WaitForSingleObject, INFINITE, WT_EXECUTEINWAITTHREAD, WT_EXECUTEONLYONCE,
@@ -80,6 +80,10 @@ unsafe fn is_overlapped_handle(handle: HANDLE) -> bool {
         return true;
     }
     (mode & (FILE_SYNCHRONOUS_IO_NONALERT | FILE_SYNCHRONOUS_IO_ALERT)) == 0
+}
+
+fn is_seekable(handle: HANDLE) -> bool {
+    unsafe { GetFileType(handle) == FILE_TYPE_DISK }
 }
 
 /// A wrapper around an overlapped `HANDLE` that implements [`io::Read`] and
@@ -530,6 +534,13 @@ where
     let raw_handle = io.into_raw_handle() as HANDLE;
 
     let arc_file = if unsafe { is_overlapped_handle(raw_handle) } {
+        if is_seekable(raw_handle) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "child stdio handle is a seekable overlapped file; \
+                this configuration is not supported",
+            ));
+        }
         // Overlapped handle: wrap it so that reads/writes go through the
         // ReadFile/WriteFile + OVERLAPPED path rather than std::fs::File::read.
         let overlapped = unsafe { OverlappedFile::new(raw_handle)? };
