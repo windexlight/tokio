@@ -24,7 +24,6 @@ use std::fmt;
 use std::fs::File as StdFile;
 use std::future::Future;
 use std::io;
-use std::io::Write;
 use std::os::windows::prelude::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle, RawHandle};
 use std::pin::Pin;
 use std::process::Stdio;
@@ -35,8 +34,7 @@ use std::task::{Context, Poll};
 
 use windows_sys::{
     Win32::Foundation::{
-        CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE,
-        NTSTATUS, STATUS_SUCCESS,
+        CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE, STATUS_SUCCESS,
         ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_IO_PENDING,
     },
     Win32::Storage::FileSystem::{
@@ -47,47 +45,30 @@ use windows_sys::{
         WaitForSingleObject, INFINITE, WT_EXECUTEINWAITTHREAD, WT_EXECUTEONLYONCE,
     },
     Win32::System::IO::{GetOverlappedResult, IO_STATUS_BLOCK, OVERLAPPED},
+    Wdk::Storage::FileSystem::{
+        FileModeInformation,
+        FILE_SYNCHRONOUS_IO_NONALERT,
+        FILE_SYNCHRONOUS_IO_ALERT,
+        NtQueryInformationFile,
+    },
 };
 
-// FileModeInformation class id for NtQueryInformationFile
-const FILE_MODE_INFORMATION: u32 = 16;
-// These flags indicate synchronous (non-overlapped) I/O.
-// If neither is set, the handle is overlapped.
-const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x00000020;
-const FILE_SYNCHRONOUS_IO_ALERT: u32 = 0x00000010;
-
-#[repr(C)]
-struct FileModeInformation {
-    mode: u32,
-}
-
-#[link(name = "ntdll")]
-extern "system" {
-    fn NtQueryInformationFile(
-        file_handle: HANDLE,
-        io_status_block: *mut IO_STATUS_BLOCK,
-        file_information: *mut std::ffi::c_void,
-        length: u32,
-        file_information_class: u32,
-    ) -> NTSTATUS;
-}
-
 /// Returns true if the handle was opened with FILE_FLAG_OVERLAPPED.
-/// On any query failure, conservatively returns false (assume synchronous).
+/// On any query failure, conservatively returns true (assume overlapped).
 unsafe fn is_overlapped_handle(handle: HANDLE) -> bool {
     let mut io_status: IO_STATUS_BLOCK = std::mem::zeroed();
-    let mut mode_info = FileModeInformation { mode: 0 };
+    let mut mode: u32 = 0;
     let status = NtQueryInformationFile(
         handle,
         &mut io_status,
-        &mut mode_info as *mut _ as *mut std::ffi::c_void,
-        std::mem::size_of::<FileModeInformation>() as u32,
-        FILE_MODE_INFORMATION,
+        &mut mode as *mut u32 as *mut std::ffi::c_void,
+        std::mem::size_of::<u32>() as u32,
+        FileModeInformation,
     );
     if status != STATUS_SUCCESS {
-        return false;
+        return true;
     }
-    (mode_info.mode & (FILE_SYNCHRONOUS_IO_NONALERT | FILE_SYNCHRONOUS_IO_ALERT)) == 0
+    (mode & (FILE_SYNCHRONOUS_IO_NONALERT | FILE_SYNCHRONOUS_IO_ALERT)) == 0
 }
 
 /// A wrapper around an overlapped HANDLE that implements io::Read and io::Write
