@@ -24,7 +24,8 @@ use std::fmt;
 use std::fs::File as StdFile;
 use std::future::Future;
 use std::io;
-use std::os::windows::prelude::{AsRawHandle, IntoRawHandle, OwnedHandle, RawHandle};
+use std::io::Write;
+use std::os::windows::prelude::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle, RawHandle};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::process::{Child as StdChild, ExitStatus};
@@ -33,12 +34,201 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use windows_sys::{
-    Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE},
-    Win32::System::Threading::{
-        GetCurrentProcess, RegisterWaitForSingleObject, UnregisterWaitEx, INFINITE,
-        WT_EXECUTEINWAITTHREAD, WT_EXECUTEONLYONCE,
+    Win32::Foundation::{
+        CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE,
+        NTSTATUS, STATUS_SUCCESS,
+        ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_IO_PENDING,
     },
+    Win32::Storage::FileSystem::{
+        ReadFile, WriteFile,
+    },
+    Win32::System::Threading::{
+        CreateEventW, GetCurrentProcess, RegisterWaitForSingleObject, UnregisterWaitEx,
+        WaitForSingleObject, INFINITE, WT_EXECUTEINWAITTHREAD, WT_EXECUTEONLYONCE,
+    },
+    Win32::System::IO::{GetOverlappedResult, IO_STATUS_BLOCK, OVERLAPPED},
 };
+
+// FileModeInformation class id for NtQueryInformationFile
+const FILE_MODE_INFORMATION: u32 = 16;
+// These flags indicate synchronous (non-overlapped) I/O.
+// If neither is set, the handle is overlapped.
+const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x00000020;
+const FILE_SYNCHRONOUS_IO_ALERT: u32 = 0x00000010;
+
+#[repr(C)]
+struct FileModeInformation {
+    mode: u32,
+}
+
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtQueryInformationFile(
+        file_handle: HANDLE,
+        io_status_block: *mut IO_STATUS_BLOCK,
+        file_information: *mut std::ffi::c_void,
+        length: u32,
+        file_information_class: u32,
+    ) -> NTSTATUS;
+}
+
+/// Returns true if the handle was opened with FILE_FLAG_OVERLAPPED.
+/// On any query failure, conservatively returns false (assume synchronous).
+unsafe fn is_overlapped_handle(handle: HANDLE) -> bool {
+    let mut io_status: IO_STATUS_BLOCK = std::mem::zeroed();
+    let mut mode_info = FileModeInformation { mode: 0 };
+    let status = NtQueryInformationFile(
+        handle,
+        &mut io_status,
+        &mut mode_info as *mut _ as *mut std::ffi::c_void,
+        std::mem::size_of::<FileModeInformation>() as u32,
+        FILE_MODE_INFORMATION,
+    );
+    if status != STATUS_SUCCESS {
+        return false;
+    }
+    (mode_info.mode & (FILE_SYNCHRONOUS_IO_NONALERT | FILE_SYNCHRONOUS_IO_ALERT)) == 0
+}
+
+/// A wrapper around an overlapped HANDLE that implements io::Read and io::Write
+/// correctly by using ReadFile/WriteFile with an explicit OVERLAPPED structure
+/// and a dedicated per-instance event object.
+///
+/// This avoids the abort in std::sys::pal::windows::handle::Handle::synchronous_read
+/// that fires when std::fs::File::read() is called on an overlapped handle.
+///
+/// See: https://github.com/rust-lang/rust/issues/81357
+struct OverlappedFile {
+    handle: HANDLE,
+    event: HANDLE,
+}
+
+// Safety: HANDLE is just a pointer-sized integer; we own both handles exclusively.
+unsafe impl Send for OverlappedFile {}
+unsafe impl Sync for OverlappedFile {}
+
+impl OverlappedFile {
+    /// Takes ownership of `handle`. Creates a dedicated manual-reset event for I/O.
+    unsafe fn new(handle: HANDLE) -> io::Result<Self> {
+        // Manual-reset event, initially unsignaled.
+        let event = CreateEventW(null_mut(), 1, 0, null_mut());
+        if event == std::ptr::null_mut() || event == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(OverlappedFile { handle, event })
+    }
+
+    fn as_raw_handle(&self) -> HANDLE {
+        self.handle
+    }
+}
+
+impl Drop for OverlappedFile {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.event);
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+impl io::Read for OverlappedFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        unsafe {
+            let mut overlapped: OVERLAPPED = std::mem::zeroed();
+            overlapped.hEvent = self.event;
+            let mut bytes_read: u32 = 0;
+
+            let ok = ReadFile(
+                self.handle,
+                buf.as_mut_ptr() as *mut _,
+                buf.len() as u32,
+                &mut bytes_read,
+                &mut overlapped,
+            );
+
+            if ok != 0 {
+                // Completed synchronously.
+                return Ok(bytes_read as usize);
+            }
+
+            let err = windows_sys::Win32::Foundation::GetLastError();
+            match err {
+                ERROR_IO_PENDING => {
+                    // Wait for the overlapped operation on our dedicated event.
+                    WaitForSingleObject(self.event, INFINITE);
+                    let mut transferred: u32 = 0;
+                    let got = GetOverlappedResult(
+                        self.handle,
+                        &mut overlapped,
+                        &mut transferred,
+                        0, // don't wait again, already waited above
+                    );
+                    if got == 0 {
+                        let e = windows_sys::Win32::Foundation::GetLastError();
+                        if e == ERROR_BROKEN_PIPE || e == ERROR_HANDLE_EOF {
+                            return Ok(0); // EOF
+                        }
+                        return Err(io::Error::from_raw_os_error(e as i32));
+                    }
+                    Ok(transferred as usize)
+                }
+                ERROR_BROKEN_PIPE | ERROR_HANDLE_EOF => Ok(0), // EOF
+                e => Err(io::Error::from_raw_os_error(e as i32)),
+            }
+        }
+    }
+}
+
+impl io::Write for OverlappedFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        unsafe {
+            let mut overlapped: OVERLAPPED = std::mem::zeroed();
+            overlapped.hEvent = self.event;
+            let mut bytes_written: u32 = 0;
+
+            let ok = WriteFile(
+                self.handle,
+                buf.as_ptr() as *const _,
+                buf.len() as u32,
+                &mut bytes_written,
+                &mut overlapped,
+            );
+
+            if ok != 0 {
+                return Ok(bytes_written as usize);
+            }
+
+            let err = windows_sys::Win32::Foundation::GetLastError();
+            match err {
+                ERROR_IO_PENDING => {
+                    WaitForSingleObject(self.event, INFINITE);
+                    let mut transferred: u32 = 0;
+                    let got = GetOverlappedResult(
+                        self.handle,
+                        &mut overlapped,
+                        &mut transferred,
+                        0,
+                    );
+                    if got == 0 {
+                        let e = windows_sys::Win32::Foundation::GetLastError();
+                        if e == ERROR_BROKEN_PIPE || e == ERROR_HANDLE_EOF {
+                            return Ok(0);
+                        }
+                        return Err(io::Error::from_raw_os_error(e as i32));
+                    }
+                    Ok(transferred as usize)
+                }
+                ERROR_BROKEN_PIPE | ERROR_HANDLE_EOF => Ok(0),
+                e => Err(io::Error::from_raw_os_error(e as i32)),
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 #[must_use = "futures do nothing unless polled"]
 pub(crate) struct Child {
@@ -166,29 +356,78 @@ unsafe extern "system" fn callback(ptr: *mut std::ffi::c_void, _timer_fired: boo
     let _ = complete.take().unwrap().send(());
 }
 
-#[derive(Debug)]
-struct ArcFile(Arc<StdFile>);
+/// A file handle that can be either a plain std::fs::File (for synchronous handles)
+/// or an OverlappedFile (for overlapped handles). Implements io::Read and io::Write
+/// for both cases, routing to the appropriate implementation.
+enum ArcFileInner {
+    Sync(Arc<StdFile>),
+    Overlapped(Arc<OverlappedFile>),
+}
+
+#[derive(Clone)]
+struct ArcFile(Arc<ArcFileInner>);
+
+impl fmt::Debug for ArcFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0.as_ref() {
+            ArcFileInner::Sync(_) => write!(f, "ArcFile(Sync)"),
+            ArcFileInner::Overlapped(_) => write!(f, "ArcFile(Overlapped)"),
+        }
+    }
+}
+
+impl ArcFile {
+    fn sync(file: StdFile) -> Self {
+        ArcFile(Arc::new(ArcFileInner::Sync(Arc::new(file))))
+    }
+
+    fn overlapped(file: OverlappedFile) -> Self {
+        ArcFile(Arc::new(ArcFileInner::Overlapped(Arc::new(file))))
+    }
+
+    fn as_raw_handle(&self) -> RawHandle {
+        match self.0.as_ref() {
+            ArcFileInner::Sync(f) => f.as_raw_handle(),
+            ArcFileInner::Overlapped(f) => f.as_raw_handle() as RawHandle,
+        }
+    }
+
+
+}
 
 impl io::Read for ArcFile {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        (&*self.0).read(bytes)
+        match self.0.as_ref() {
+            ArcFileInner::Sync(f) => (&**f).read(bytes),
+            ArcFileInner::Overlapped(f) => {
+                // Safety: Blocking<ArcFile> ensures only one thread calls read at a time.
+                let f = unsafe { &mut *(Arc::as_ptr(f) as *mut OverlappedFile) };
+                f.read(bytes)
+            }
+        }
     }
 }
 
 impl io::Write for ArcFile {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        (&*self.0).write(bytes)
+        match self.0.as_ref() {
+            ArcFileInner::Sync(f) => (&**f).write(bytes),
+            ArcFileInner::Overlapped(f) => {
+                let f = unsafe { &mut *(Arc::as_ptr(f) as *mut OverlappedFile) };
+                f.write(bytes)
+            }
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        (&*self.0).flush()
+        Ok(())
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct ChildStdio {
     // Used for accessing the raw handle, even if the io version is busy
-    raw: Arc<StdFile>,
+    inner: ArcFile,
     // For doing I/O operations asynchronously
     io: Blocking<ArcFile>,
 }
@@ -201,7 +440,7 @@ impl ChildStdio {
 
 impl AsRawHandle for ChildStdio {
     fn as_raw_handle(&self) -> RawHandle {
-        self.raw.as_raw_handle()
+        self.inner.as_raw_handle()
     }
 }
 
@@ -233,26 +472,63 @@ impl AsyncWrite for ChildStdio {
     }
 }
 
+/// Wrap a raw stdio handle for use with Tokio's Blocking I/O.
+///
+/// If the handle is overlapped, wraps it in OverlappedFile which uses
+/// ReadFile/WriteFile with an explicit OVERLAPPED + event object, correctly
+/// handling async I/O without aborting. Non-overlapped handles use the
+/// original std::fs::File path unchanged.
+///
+/// See: https://github.com/rust-lang/rust/issues/81357
+///      https://github.com/rust-lang/rust/pull/98950
 pub(super) fn stdio<T>(io: T) -> io::Result<ChildStdio>
 where
     T: IntoRawHandle,
 {
-    use std::os::windows::prelude::FromRawHandle;
+    let raw_handle = io.into_raw_handle() as HANDLE;
 
-    let raw = Arc::new(unsafe { StdFile::from_raw_handle(io.into_raw_handle()) });
-    let io = ArcFile(raw.clone());
-    // SAFETY: the `Read` implementation of `io` does not
+    let arc_file = if unsafe { is_overlapped_handle(raw_handle) } {
+        // Overlapped handle: use OverlappedFile which reads via ReadFile + OVERLAPPED.
+        let overlapped = unsafe { OverlappedFile::new(raw_handle)? };
+        ArcFile::overlapped(overlapped)
+    } else {
+        // Synchronous handle: use std::fs::File as before.
+        let file = unsafe { StdFile::from_raw_handle(raw_handle as RawHandle) };
+        ArcFile::sync(file)
+    };
+
+    let io_clone = arc_file.clone();
+    // SAFETY: the `Read` implementation of `io_clone` does not
     // read from the buffer it is borrowing and correctly
     // reports the length of the data written into the buffer.
-    let io = unsafe { Blocking::new(io) };
-    Ok(ChildStdio { raw, io })
+    let io = unsafe { Blocking::new(io_clone) };
+    Ok(ChildStdio { inner: arc_file, io })
 }
 
 fn convert_to_file(child_stdio: ChildStdio) -> io::Result<StdFile> {
-    let ChildStdio { raw, io } = child_stdio;
-    drop(io); // Try to drop the Arc count here
+    let ChildStdio { inner, io } = child_stdio;
+    drop(io);
 
-    Arc::try_unwrap(raw).or_else(|raw| duplicate_handle(&*raw))
+    match Arc::try_unwrap(inner.0) {
+        Ok(ArcFileInner::Sync(arc)) => {
+            Arc::try_unwrap(arc).or_else(|arc| duplicate_handle(&*arc))
+        }
+        Ok(ArcFileInner::Overlapped(arc)) => {
+            // Duplicate the handle as a plain StdFile.
+            // The OverlappedFile will be dropped (closing original handle) after duplication.
+            match Arc::try_unwrap(arc) {
+                Ok(f) => duplicate_handle_raw(f.handle),
+                Err(arc) => duplicate_handle_raw(arc.handle),
+            }
+        }
+        Err(arc) => {
+            // Arc still has other owners; duplicate whichever variant.
+            match arc.as_ref() {
+                ArcFileInner::Sync(f) => duplicate_handle(&**f),
+                ArcFileInner::Overlapped(f) => duplicate_handle_raw(f.handle),
+            }
+        }
+    }
 }
 
 pub(crate) fn convert_to_stdio(child_stdio: ChildStdio) -> io::Result<Stdio> {
@@ -260,15 +536,17 @@ pub(crate) fn convert_to_stdio(child_stdio: ChildStdio) -> io::Result<Stdio> {
 }
 
 fn duplicate_handle<T: AsRawHandle>(io: &T) -> io::Result<StdFile> {
-    use std::os::windows::prelude::FromRawHandle;
+    duplicate_handle_raw(io.as_raw_handle() as HANDLE)
+}
 
+fn duplicate_handle_raw(handle: HANDLE) -> io::Result<StdFile> {
     unsafe {
         let mut dup_handle = INVALID_HANDLE_VALUE;
         let cur_proc = GetCurrentProcess();
 
         let status = DuplicateHandle(
             cur_proc,
-            io.as_raw_handle() as _,
+            handle,
             cur_proc,
             &mut dup_handle,
             0,
@@ -280,6 +558,6 @@ fn duplicate_handle<T: AsRawHandle>(io: &T) -> io::Result<StdFile> {
             return Err(io::Error::last_os_error());
         }
 
-        Ok(StdFile::from_raw_handle(dup_handle as _))
+        Ok(StdFile::from_raw_handle(dup_handle as RawHandle))
     }
 }
