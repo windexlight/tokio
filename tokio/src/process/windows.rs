@@ -108,16 +108,6 @@ unsafe fn is_overlapped_handle(handle: HANDLE) -> bool {
     (mode & (FILE_SYNCHRONOUS_IO_NONALERT | FILE_SYNCHRONOUS_IO_ALERT)) == 0
 }
 
-/// Returns `true` if `handle` refers to a disk file (i.e. is seekable).
-///
-/// # Safety
-///
-/// `handle` must be a valid open `HANDLE`.
-#[must_use]
-unsafe fn is_seekable(handle: HANDLE) -> bool {
-    unsafe { GetFileType(handle) == FILE_TYPE_DISK }
-}
-
 /// Mutable I/O state for an overlapped handle.
 ///
 /// Kept behind a `Mutex` inside [`OverlappedInner`] so that concurrent
@@ -646,7 +636,7 @@ where
     // `into_raw_handle` on a live stdio object.
     let arc_file = if unsafe { is_overlapped_handle(raw_handle) } {
         // SAFETY: same as above.
-        if unsafe { is_seekable(raw_handle) } {
+        if unsafe { GetFileType(raw_handle) } == FILE_TYPE_DISK {
             // Seekable overlapped handles would require position tracking
             // inside OverlappedFile (since ReadFile/WriteFile on overlapped
             // handles do not advance an implicit file pointer).  That is out
