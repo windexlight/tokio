@@ -85,10 +85,6 @@ use windows_sys::{
 /// `handle` must be a valid open `HANDLE`.
 #[must_use]
 unsafe fn is_overlapped_handle(handle: HANDLE) -> bool {
-    // Zero-initialise the IO_STATUS_BLOCK out-parameter and call the NT
-    // function in a single unsafe block — both operations form one logical
-    // unit; splitting them would imply the zeroing carries independent
-    // unsafety.
     let mut mode: u32 = 0;
     let status = unsafe {
         let mut io_status = std::mem::zeroed();
@@ -108,93 +104,26 @@ unsafe fn is_overlapped_handle(handle: HANDLE) -> bool {
     (mode & (FILE_SYNCHRONOUS_IO_NONALERT | FILE_SYNCHRONOUS_IO_ALERT)) == 0
 }
 
-/// Mutable I/O state for an overlapped handle.
+/// Owns the manual-reset event used to signal overlapped I/O completion.
 ///
-/// Kept behind a `Mutex` inside [`OverlappedInner`] so that concurrent
-/// callers serialise their access to the `OVERLAPPED` struct and event handle
-/// rather than racing on them.
-struct OverlappedState {
-    /// Manual-reset event used to signal I/O completion.  Created once at
-    /// construction and closed in `Drop`.
-    event: HANDLE,
-}
+/// Kept behind a `Mutex` inside [`OverlappedFile`] so that concurrent callers
+/// serialise their access to the `OVERLAPPED` struct and the event handle.
+struct EventHandle(HANDLE);
 
-// SAFETY: `HANDLE` is a pointer-sized integer.  `OverlappedState` is only
-// ever accessed through `Mutex<OverlappedState>`; the mutex enforces exclusive
-// access.
-unsafe impl Send for OverlappedState {}
+// SAFETY: `HANDLE` is a pointer-sized integer.  `EventHandle` is only ever
+// accessed through `Mutex<EventHandle>`; the mutex enforces exclusive access.
+unsafe impl Send for EventHandle {}
+unsafe impl Sync for EventHandle {}
 
-// SAFETY: all mutable access is serialised through the enclosing
-// `Mutex<OverlappedState>` in `OverlappedInner`.
-unsafe impl Sync for OverlappedState {}
-
-impl Drop for OverlappedState {
+impl Drop for EventHandle {
     fn drop(&mut self) {
-        // SAFETY: we own `event` and this is the only place it is closed.
-        unsafe {
-            CloseHandle(self.event);
-        }
-    }
-}
-
-/// The immutable part of an overlapped handle — the `HANDLE` value itself.
-///
-/// Storing `handle` outside the `Mutex` means [`OverlappedInner::as_raw_handle`]
-/// can return it cheaply without acquiring any lock, matching the expectation
-/// that handle accessors are non-blocking.
-struct OverlappedInner {
-    /// The underlying overlapped `HANDLE`.  Immutable after construction.
-    handle: HANDLE,
-    /// Mutable per-operation state, serialised by the mutex.
-    state: Mutex<OverlappedState>,
-}
-
-// SAFETY: `HANDLE` is a pointer-sized integer.  `handle` is immutable after
-// construction.  All mutable access to `state` is serialised by the `Mutex`.
-unsafe impl Send for OverlappedInner {}
-unsafe impl Sync for OverlappedInner {}
-
-impl OverlappedInner {
-    /// Takes ownership of `handle` and creates a dedicated manual-reset event
-    /// for overlapped I/O completion.
-    ///
-    /// # Safety
-    ///
-    /// `handle` must be a valid `HANDLE` opened with `FILE_FLAG_OVERLAPPED`
-    /// and must not be owned by any other value after this call.
-    unsafe fn new(handle: HANDLE) -> io::Result<Self> {
-        // lpEventAttributes = null  → default security, not inheritable
-        // bManualReset      = 1     → manual-reset; we reset it ourselves
-        // bInitialState     = 0     → initially unsignaled
-        // lpName            = null  → unnamed
-        let event = unsafe { CreateEventW(null_mut(), 1, 0, null_mut()) };
-        if event.is_null() || event == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(OverlappedInner {
-            handle,
-            state: Mutex::new(OverlappedState { event }),
-        })
-    }
-
-    fn as_raw_handle(&self) -> HANDLE {
-        // `handle` is immutable after construction; no lock needed.
-        self.handle
-    }
-}
-
-impl Drop for OverlappedInner {
-    fn drop(&mut self) {
-        // SAFETY: we own `handle` and this is the only place it is closed.
-        // `state` (and the event inside it) is dropped by its own `Drop` impl.
-        unsafe {
-            CloseHandle(self.handle);
-        }
+        // SAFETY: we own this event handle and this is the only place it is closed.
+        unsafe { CloseHandle(self.0) };
     }
 }
 
 /// A wrapper around an overlapped `HANDLE` that implements [`io::Read`] and
-/// [`io::Write`] correctly by using `ReadFile`/`WriteFile` with an explicit
+/// [`io::Write`] correctly, using `ReadFile`/`WriteFile` with an explicit
 /// `OVERLAPPED` structure and a dedicated per-instance manual-reset event.
 ///
 /// This avoids the `process::abort()` in
@@ -205,6 +134,15 @@ impl Drop for OverlappedInner {
 /// Using a dedicated event object (rather than waiting on the file handle
 /// itself) eliminates the ambiguity that made the stdlib's fallback
 /// `WaitForSingleObject`-on-file-handle approach unreliable.
+///
+/// # Layout
+///
+/// `handle` is stored as a bare field — immutable after construction — so that
+/// [`ArcFile::as_raw_handle`] can read it without acquiring any lock.
+/// `event` is the only thing that changes during an operation and is therefore
+/// kept behind a `Mutex`.  Any concurrent caller reaching the same
+/// `OverlappedFile` through a different [`ArcFile`] clone blocks on that mutex
+/// rather than racing on the `OVERLAPPED` struct.
 ///
 /// # Seekable overlapped handles
 ///
@@ -218,26 +156,69 @@ impl Drop for OverlappedInner {
 /// type is only ever instantiated for non-seekable handles.
 ///
 /// See: <https://github.com/rust-lang/rust/issues/81357>
-struct OverlappedFile(OverlappedInner);
+struct OverlappedFile {
+    /// The underlying overlapped `HANDLE`.  Immutable after construction;
+    /// readable without acquiring `event`.
+    handle: HANDLE,
+    /// Mutable per-operation state: the completion event.  Serialised by the
+    /// mutex so concurrent callers do not race on the `OVERLAPPED` struct.
+    event: Mutex<EventHandle>,
+}
 
-impl io::Read for OverlappedFile {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let state = self.0.state.lock().unwrap();
-        // SAFETY: all Win32 calls are made with valid, owned handles and
-        // correctly initialised OVERLAPPED / buffer pointers.  The OVERLAPPED
-        // struct lives on the stack for the duration of this call.  The
-        // `INFINITE` wait below guarantees the kernel has released its
-        // reference to the struct before `read` returns, making stack
-        // allocation sound.
+// SAFETY: `handle` is immutable after construction.  All mutable access to
+// `event` is serialised by the `Mutex`.
+unsafe impl Send for OverlappedFile {}
+unsafe impl Sync for OverlappedFile {}
+
+impl OverlappedFile {
+    /// Takes ownership of `handle` and creates a dedicated manual-reset event
+    /// for overlapped I/O completion.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be a valid `HANDLE` opened with `FILE_FLAG_OVERLAPPED`
+    /// and must not be owned by any other value after this call.
+    unsafe fn new(handle: HANDLE) -> io::Result<Self> {
+        // lpEventAttributes = null  → default security, not inheritable
+        // bManualReset      = 1     → manual-reset; we reset it ourselves
+        //                             before each new operation
+        // bInitialState     = 0     → initially unsignaled
+        // lpName            = null  → unnamed
+        let event = unsafe { CreateEventW(null_mut(), 1, 0, null_mut()) };
+        if event.is_null() || event == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(OverlappedFile {
+            handle,
+            event: Mutex::new(EventHandle(event)),
+        })
+    }
+
+    /// Performs a blocking overlapped read, serialised through the inner mutex.
+    ///
+    /// Takes `&self` so that [`ArcFile`] can call it without a `*const`-to-`*mut`
+    /// cast.  All mutable state (`OVERLAPPED` struct, event handle) is accessed
+    /// only after acquiring the mutex, so there is no aliasing.
+    fn do_read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let ev = self.event.lock().unwrap();
+        // SAFETY: all Win32 calls use valid, owned handles and correctly
+        // initialised OVERLAPPED / buffer pointers.  The OVERLAPPED struct
+        // lives on the stack; the INFINITE wait below guarantees the kernel
+        // has finished with it before this function returns.
         unsafe {
+            // Reset the event before issuing the new operation so that a
+            // stale signal from the previous call does not cause an immediate
+            // spurious return from WaitForSingleObject.
+            windows_sys::Win32::System::Threading::ResetEvent(ev.0);
+
             let mut overlapped: OVERLAPPED = std::mem::zeroed();
-            overlapped.hEvent = state.event;
+            overlapped.hEvent = ev.0;
             let mut bytes_read: u32 = 0;
 
             let ok = ReadFile(
-                self.0.handle,
+                self.handle,
                 buf.as_mut_ptr().cast(),
-                buf.len() as u32,
+                buf.len().min(u32::MAX as usize) as u32,
                 &mut bytes_read,
                 &mut overlapped,
             );
@@ -250,21 +231,16 @@ impl io::Read for OverlappedFile {
             match GetLastError() {
                 ERROR_IO_PENDING => {
                     // Wait for completion on our dedicated event object.
-                    // `INFINITE` means we block until the kernel signals it,
-                    // which guarantees the OVERLAPPED struct is no longer
-                    // referenced when we proceed.
-                    let wait = WaitForSingleObject(state.event, INFINITE);
+                    // INFINITE blocks until the kernel signals it, which
+                    // guarantees the OVERLAPPED struct is no longer referenced
+                    // when we proceed.
+                    let wait = WaitForSingleObject(ev.0, INFINITE);
                     if wait == WAIT_FAILED {
                         return Err(io::Error::last_os_error());
                     }
                     let mut transferred: u32 = 0;
                     // bWait = 0: we already waited above.
-                    let ok = GetOverlappedResult(
-                        self.0.handle,
-                        &mut overlapped,
-                        &mut transferred,
-                        0,
-                    );
+                    let ok = GetOverlappedResult(self.handle, &mut overlapped, &mut transferred, 0);
                     if ok == 0 {
                         match GetLastError() {
                             ERROR_BROKEN_PIPE | ERROR_HANDLE_EOF => return Ok(0),
@@ -278,21 +254,24 @@ impl io::Read for OverlappedFile {
             }
         }
     }
-}
 
-impl io::Write for OverlappedFile {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let state = self.0.state.lock().unwrap();
-        // SAFETY: same rationale as `Read` above.
+    /// Performs a blocking overlapped write, serialised through the inner mutex.
+    ///
+    /// See [`do_read`](Self::do_read) for the rationale for `&self`.
+    fn do_write(&self, buf: &[u8]) -> io::Result<usize> {
+        let ev = self.event.lock().unwrap();
+        // SAFETY: same rationale as `do_read`.
         unsafe {
+            windows_sys::Win32::System::Threading::ResetEvent(ev.0);
+
             let mut overlapped: OVERLAPPED = std::mem::zeroed();
-            overlapped.hEvent = state.event;
+            overlapped.hEvent = ev.0;
             let mut bytes_written: u32 = 0;
 
             let ok = WriteFile(
-                self.0.handle,
+                self.handle,
                 buf.as_ptr().cast(),
-                buf.len() as u32,
+                buf.len().min(u32::MAX as usize) as u32,
                 &mut bytes_written,
                 &mut overlapped,
             );
@@ -303,17 +282,12 @@ impl io::Write for OverlappedFile {
 
             match GetLastError() {
                 ERROR_IO_PENDING => {
-                    let wait = WaitForSingleObject(state.event, INFINITE);
+                    let wait = WaitForSingleObject(ev.0, INFINITE);
                     if wait == WAIT_FAILED {
                         return Err(io::Error::last_os_error());
                     }
                     let mut transferred: u32 = 0;
-                    let ok = GetOverlappedResult(
-                        self.0.handle,
-                        &mut overlapped,
-                        &mut transferred,
-                        0,
-                    );
+                    let ok = GetOverlappedResult(self.handle, &mut overlapped, &mut transferred, 0);
                     if ok == 0 {
                         match GetLastError() {
                             // A broken pipe on write is a real error: the
@@ -335,11 +309,32 @@ impl io::Write for OverlappedFile {
             }
         }
     }
+}
+
+impl Drop for OverlappedFile {
+    fn drop(&mut self) {
+        // SAFETY: we own `handle`; `event` is closed by `EventHandle::drop`.
+        unsafe { CloseHandle(self.handle) };
+    }
+}
+
+impl io::Read for OverlappedFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.do_read(buf)
+    }
+}
+
+impl io::Write for OverlappedFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.do_write(buf)
+    }
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
+
+// ---- Child process wait machinery (unchanged from original) -----------------
 
 #[must_use = "futures do nothing unless polled"]
 pub(crate) struct Child {
@@ -467,35 +462,32 @@ unsafe extern "system" fn callback(ptr: *mut std::ffi::c_void, _timer_fired: boo
     let _ = complete.take().unwrap().send(());
 }
 
+// ---- ArcFile and ChildStdio -------------------------------------------------
+
 /// The inner handle held by an [`ArcFile`].
 ///
-/// `Sync` (non-overlapped) handles are wrapped in `StdFile`.
-/// Overlapped handles are wrapped in `OverlappedFile`.  Concurrent I/O
-/// callers are serialised by the `Mutex<OverlappedState>` *inside*
-/// `OverlappedFile` — there is no outer `Mutex` here.  `ArcFile::read` and
-/// `ArcFile::write` take `&mut self`, which gives them exclusive access to
-/// the `Arc` reference; they then reach through to `OverlappedFile::read` /
-/// `OverlappedFile::write`, which take `&mut self` and acquire the inner lock.
+/// Non-overlapped handles are wrapped in [`StdFile`] and use the standard
+/// `std::fs::File` I/O path.  Overlapped handles are wrapped in
+/// [`OverlappedFile`]; all mutation is serialised by the `Mutex<EventHandle>`
+/// inside `OverlappedFile`, so no outer `Mutex` is needed here.
 ///
-/// `OverlappedInner::handle` is stored *outside* the inner `Mutex` (as a
-/// bare field on `OverlappedInner`) so that [`ArcFile::as_raw_handle`] can
-/// return it without acquiring any lock.
+/// [`OverlappedFile::handle`] is stored outside any mutex, which lets
+/// [`ArcFile::as_raw_handle`] return the raw handle without acquiring a lock.
 enum ArcFileInner {
     Sync(StdFile),
     Overlapped(OverlappedFile),
 }
 
-// SAFETY: `ArcFileInner::Overlapped` contains `OverlappedFile`, which wraps
-// `OverlappedInner`.  `OverlappedInner` is `Send + Sync` — `handle` is
-// immutable after construction, and all mutable state is behind a `Mutex`.
+// SAFETY: `ArcFileInner::Overlapped` is `Send + Sync`: `handle` is immutable
+// after construction, and all mutable state is behind a `Mutex`.
 unsafe impl Send for ArcFileInner {}
 unsafe impl Sync for ArcFileInner {}
 
-/// A cloneable, cheaply shared file handle that correctly handles both
-/// synchronous and overlapped Windows HANDLEs.
+/// A cheaply cloneable file handle that correctly handles both synchronous and
+/// overlapped Windows `HANDLE`s.
 ///
-/// Cloning increments an `Arc` reference count; no duplication of the
-/// underlying OS handle occurs.  All clones share the same `ArcFileInner`.
+/// Cloning increments an `Arc` reference count; no OS handle duplication
+/// occurs.  All clones share the same `ArcFileInner`.
 #[derive(Clone)]
 struct ArcFile(Arc<ArcFileInner>);
 
@@ -520,9 +512,9 @@ impl ArcFile {
     fn as_raw_handle(&self) -> RawHandle {
         match &*self.0 {
             ArcFileInner::Sync(f) => f.as_raw_handle(),
-            // `OverlappedInner::handle` is immutable after construction;
+            // `OverlappedFile::handle` is immutable after construction;
             // read it directly without acquiring the I/O-state mutex.
-            ArcFileInner::Overlapped(f) => f.0.as_raw_handle() as RawHandle,
+            ArcFileInner::Overlapped(f) => f.handle as RawHandle,
         }
     }
 }
@@ -531,16 +523,9 @@ impl io::Read for ArcFile {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         match &*self.0 {
             ArcFileInner::Sync(f) => (&*f).read(bytes),
-            // SAFETY: We need `&mut OverlappedFile` to call `read`, but the
-            // `Arc` only gives us `&OverlappedFile`.  The cast is sound because
-            // `OverlappedFile::read` never aliases its own fields unsafely: all
-            // mutable state (`OVERLAPPED` struct, event handle) is accessed only
-            // after acquiring `Mutex<OverlappedState>`.  Any concurrent caller
-            // reaching the same `OverlappedFile` through a different `ArcFile`
-            // clone will block on that same mutex, so there is no data race.
-            ArcFileInner::Overlapped(f) => unsafe {
-                (&mut *(f as *const OverlappedFile as *mut OverlappedFile)).read(bytes)
-            },
+            // `do_read` takes `&self` and acquires the inner mutex itself, so
+            // no unsafe is needed here despite the shared `Arc` reference.
+            ArcFileInner::Overlapped(f) => f.do_read(bytes),
         }
     }
 }
@@ -549,11 +534,7 @@ impl io::Write for ArcFile {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         match &*self.0 {
             ArcFileInner::Sync(f) => (&*f).write(bytes),
-            // SAFETY: same rationale as `Read` above — all mutable state in
-            // `OverlappedFile` is guarded by `Mutex<OverlappedState>`.
-            ArcFileInner::Overlapped(f) => unsafe {
-                (&mut *(f as *const OverlappedFile as *mut OverlappedFile)).write(bytes)
-            },
+            ArcFileInner::Overlapped(f) => f.do_write(bytes),
         }
     }
 
@@ -635,22 +616,20 @@ where
     // SAFETY: `raw_handle` is a valid open handle — it was just produced by
     // `into_raw_handle` on a live stdio object.
     let arc_file = if unsafe { is_overlapped_handle(raw_handle) } {
-        // SAFETY: same as above.
         if unsafe { GetFileType(raw_handle) } == FILE_TYPE_DISK {
             // Seekable overlapped handles would require position tracking
-            // inside OverlappedFile (since ReadFile/WriteFile on overlapped
-            // handles do not advance an implicit file pointer).  That is out
-            // of scope for this targeted fix; fail loudly rather than
-            // silently corrupting data.
+            // inside OverlappedFile (ReadFile/WriteFile on overlapped handles
+            // do not advance an implicit file pointer).  Fail loudly rather
+            // than silently corrupting data.
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "child stdio handle is a seekable overlapped file; \
                 this configuration is not supported",
             ));
         }
-        // SAFETY: `raw_handle` is a valid overlapped handle that is not owned
-        // by any other value after `into_raw_handle`.
-        let overlapped = unsafe { OverlappedFile(OverlappedInner::new(raw_handle)?) };
+        // SAFETY: `raw_handle` is a valid overlapped handle, exclusively owned
+        // after `into_raw_handle`.
+        let overlapped = unsafe { OverlappedFile::new(raw_handle)? };
         ArcFile::overlapped(overlapped)
     } else {
         // Synchronous handle: unchanged behaviour from before this patch.
@@ -667,35 +646,32 @@ where
 
 fn convert_to_file(child_stdio: ChildStdio) -> io::Result<StdFile> {
     let ChildStdio { inner, io } = child_stdio;
-    // Drop `io` first to release its clone of the Arc before we try
-    // `try_unwrap` below.
+    // Drop `io` first to release its clone of the Arc before `try_unwrap`.
     drop(io);
 
     match Arc::try_unwrap(inner.0) {
         Ok(ArcFileInner::Sync(f)) => Ok(f),
         Ok(ArcFileInner::Overlapped(f)) => {
             // We are the sole owner of the OverlappedFile.  Duplicate the
-            // underlying handle as a synchronous StdFile for the caller, then
-            // let the OverlappedFile (and its event) drop normally.
+            // underlying handle as a plain StdFile for the caller, then let
+            // the OverlappedFile (and its event) drop normally.
             //
             // NOTE: `DuplicateHandle` with `DUPLICATE_SAME_ACCESS` preserves
-            // the original access rights but produces a *new* kernel handle
-            // object.  The duplicate will be synchronous if and only if the
-            // source was opened synchronously — an overlapped source yields an
-            // overlapped duplicate.  Callers of `into_owned_handle` must not
-            // use the returned handle for blocking std I/O; it is intended for
-            // passing to child processes via `Stdio::from` or similar.
-            duplicate_handle_raw(f.0.handle)
+            // access rights but produces a new kernel handle object.  The
+            // duplicate will be overlapped if the source was overlapped.
+            // Callers of `into_owned_handle` must not use the returned handle
+            // for blocking std I/O; it is intended for passing to child
+            // processes via `Stdio::from` or similar.
+            duplicate_handle_raw(f.handle)
             // `f` drops here, closing the original overlapped handle and event.
         }
         Err(arc) => {
-            // Other clones of the Arc still exist (e.g. a `ChildStdio` on
-            // another task).  Duplicate the handle so the caller gets an
-            // independent StdFile without disturbing the live clone.
+            // Other Arc clones still exist.  Duplicate the handle so the
+            // caller gets an independent StdFile without disturbing live clones.
             match &*arc {
                 ArcFileInner::Sync(f) => duplicate_handle(f),
                 // See NOTE above regarding the duplicate being overlapped.
-                ArcFileInner::Overlapped(f) => duplicate_handle_raw(f.0.handle),
+                ArcFileInner::Overlapped(f) => duplicate_handle_raw(f.handle),
             }
         }
     }
