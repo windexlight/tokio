@@ -60,8 +60,9 @@ use windows_sys::{
     Win32::Storage::FileSystem::{GetFileType, ReadFile, WriteFile, FILE_TYPE_DISK},
     Win32::System::IO::{GetOverlappedResult, OVERLAPPED},
     Win32::System::Threading::{
-        CreateEventW, GetCurrentProcess, RegisterWaitForSingleObject, UnregisterWaitEx,
-        WaitForSingleObject, INFINITE, WT_EXECUTEINWAITTHREAD, WT_EXECUTEONLYONCE,
+        CreateEventW, GetCurrentProcess, RegisterWaitForSingleObject, ResetEvent,
+        UnregisterWaitEx, WaitForSingleObject, INFINITE, WT_EXECUTEINWAITTHREAD,
+        WT_EXECUTEONLYONCE,
     },
     Wdk::Storage::FileSystem::{
         FileModeInformation, NtQueryInformationFile, FILE_SYNCHRONOUS_IO_ALERT,
@@ -111,9 +112,9 @@ unsafe fn is_overlapped_handle(handle: HANDLE) -> bool {
 struct EventHandle(HANDLE);
 
 // SAFETY: `HANDLE` is a pointer-sized integer.  `EventHandle` is only ever
-// accessed through `Mutex<EventHandle>`; the mutex enforces exclusive access.
+// accessed through `Mutex<EventHandle>`, which enforces exclusive access and
+// provides the `Sync` bound itself.
 unsafe impl Send for EventHandle {}
-unsafe impl Sync for EventHandle {}
 
 impl Drop for EventHandle {
     fn drop(&mut self) {
@@ -200,6 +201,10 @@ impl OverlappedFile {
     /// cast.  All mutable state (`OVERLAPPED` struct, event handle) is accessed
     /// only after acquiring the mutex, so there is no aliasing.
     fn do_read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        // The mutex is held for the full duration of the operation, including
+        // the WaitForSingleObject call.  This serialises concurrent callers
+        // (e.g. two ArcFile clones on different blocking-pool threads) and
+        // keeps the event handle alive for the wait — both are intentional.
         let ev = self.event.lock().unwrap();
         // SAFETY: all Win32 calls use valid, owned handles and correctly
         // initialised OVERLAPPED / buffer pointers.  The OVERLAPPED struct
@@ -209,7 +214,7 @@ impl OverlappedFile {
             // Reset the event before issuing the new operation so that a
             // stale signal from the previous call does not cause an immediate
             // spurious return from WaitForSingleObject.
-            windows_sys::Win32::System::Threading::ResetEvent(ev.0);
+            ResetEvent(ev.0);
 
             let mut overlapped: OVERLAPPED = std::mem::zeroed();
             overlapped.hEvent = ev.0;
@@ -262,7 +267,7 @@ impl OverlappedFile {
         let ev = self.event.lock().unwrap();
         // SAFETY: same rationale as `do_read`.
         unsafe {
-            windows_sys::Win32::System::Threading::ResetEvent(ev.0);
+            ResetEvent(ev.0);
 
             let mut overlapped: OVERLAPPED = std::mem::zeroed();
             overlapped.hEvent = ev.0;
@@ -333,8 +338,6 @@ impl io::Write for OverlappedFile {
         Ok(())
     }
 }
-
-// ---- Child process wait machinery (unchanged from original) -----------------
 
 #[must_use = "futures do nothing unless polled"]
 pub(crate) struct Child {
@@ -462,8 +465,6 @@ unsafe extern "system" fn callback(ptr: *mut std::ffi::c_void, _timer_fired: boo
     let _ = complete.take().unwrap().send(());
 }
 
-// ---- ArcFile and ChildStdio -------------------------------------------------
-
 /// The inner handle held by an [`ArcFile`].
 ///
 /// Non-overlapped handles are wrapped in [`StdFile`] and use the standard
@@ -477,11 +478,6 @@ enum ArcFileInner {
     Sync(StdFile),
     Overlapped(OverlappedFile),
 }
-
-// SAFETY: `ArcFileInner::Overlapped` is `Send + Sync`: `handle` is immutable
-// after construction, and all mutable state is behind a `Mutex`.
-unsafe impl Send for ArcFileInner {}
-unsafe impl Sync for ArcFileInner {}
 
 /// A cheaply cloneable file handle that correctly handles both synchronous and
 /// overlapped Windows `HANDLE`s.
@@ -508,7 +504,9 @@ impl ArcFile {
     fn overlapped(file: OverlappedFile) -> Self {
         ArcFile(Arc::new(ArcFileInner::Overlapped(file)))
     }
+}
 
+impl AsRawHandle for ArcFile {
     fn as_raw_handle(&self) -> RawHandle {
         match &*self.0 {
             ArcFileInner::Sync(f) => f.as_raw_handle(),
@@ -669,7 +667,7 @@ fn convert_to_file(child_stdio: ChildStdio) -> io::Result<StdFile> {
             // Other Arc clones still exist.  Duplicate the handle so the
             // caller gets an independent StdFile without disturbing live clones.
             match &*arc {
-                ArcFileInner::Sync(f) => duplicate_handle(f),
+                ArcFileInner::Sync(f) => duplicate_handle_raw(f.as_raw_handle() as HANDLE),
                 // See NOTE above regarding the duplicate being overlapped.
                 ArcFileInner::Overlapped(f) => duplicate_handle_raw(f.handle),
             }
@@ -679,10 +677,6 @@ fn convert_to_file(child_stdio: ChildStdio) -> io::Result<StdFile> {
 
 pub(crate) fn convert_to_stdio(child_stdio: ChildStdio) -> io::Result<Stdio> {
     convert_to_file(child_stdio).map(Stdio::from)
-}
-
-fn duplicate_handle<T: AsRawHandle>(io: &T) -> io::Result<StdFile> {
-    duplicate_handle_raw(io.as_raw_handle() as HANDLE)
 }
 
 fn duplicate_handle_raw(handle: HANDLE) -> io::Result<StdFile> {
