@@ -202,6 +202,7 @@ impl OverlappedFile {
         // lpName            = null  → unnamed
         let event = unsafe { CreateEventW(null_mut(), 1, 0, null_mut()) };
         if event.is_null() || event == INVALID_HANDLE_VALUE {
+            unsafe { CloseHandle(handle) };
             return Err(io::Error::last_os_error());
         }
         Ok(OverlappedFile {
